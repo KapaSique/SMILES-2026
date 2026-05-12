@@ -13,13 +13,16 @@ class ZeroOrderOptimizer:
         lr: float = 0.002,
         eps: float = 1e-3,
         perturbation_mode: str = "rademacher",
-        n_perturbations: int = 128,
-        inner_steps: int = 32,
+        n_perturbations: int = 256,
+        inner_steps: int = 64,
         beta1: float = 0.9,
         beta2: float = 0.999,
         adam_eps: float = 1e-8,
         weight_decay: float = 5e-4,
         grad_clip: float = 1.0,
+        total_steps: int | None = 256,
+        warmup_steps: int = 8,
+        min_lr_ratio: float = 0.05,
     ) -> None:
         self.model = model
         self.lr = lr
@@ -38,6 +41,11 @@ class ZeroOrderOptimizer:
         self.adam_eps = adam_eps
         self.weight_decay = weight_decay
         self.grad_clip = float(grad_clip)
+        self.base_lr = float(lr)
+        self.total_steps = total_steps
+        self.warmup_steps = int(warmup_steps)
+        self.min_lr_ratio = float(min_lr_ratio)
+        self._outer_t = 0
         self._t = 0
         self._m: dict[str, torch.Tensor] = {}
         self._v: dict[str, torch.Tensor] = {}
@@ -136,9 +144,24 @@ class ZeroOrderOptimizer:
     def _cache_features_only(self) -> bool:
         return all(name.startswith("fc.") for name in self.layer_names)
 
+    def _scheduled_lr(self) -> float:
+        import math
+        t = self._outer_t
+        total = self.total_steps or 1
+        warm = max(0, self.warmup_steps)
+        if t < warm:
+            return self.base_lr * float(t + 1) / float(max(1, warm))
+        if total <= warm:
+            return self.base_lr
+        progress = (t - warm) / float(max(1, total - warm))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.base_lr * (self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine)
+
     def step(self, loss_fn: Callable[[], float]) -> float:
         params = self._active_params()
         model = self.model
+        self.lr = self._scheduled_lr()
 
         if self._cache_features_only() and hasattr(model, "fc"):
             original_forward = model.forward
@@ -173,4 +196,5 @@ class ZeroOrderOptimizer:
             grads = self._estimate_grad(loss_fn, params)
             self._update_params(params, grads)
 
+        self._outer_t += 1
         return float(loss_before)
